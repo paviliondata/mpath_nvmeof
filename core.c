@@ -1206,7 +1206,6 @@ static void nvme_mpath_cancel_ios(struct nvme_ns *mpath_ns)
 		bio->bi_bdev = priv->bi_bdev;
 		bio->bi_end_io = priv->bi_end_io;
 		bio->bi_private = priv->bi_private;
-		printk ("%s %d BIO ENDIO>>>>>>>>>>>>>>>>>>>>>>>\n",__FUNCTION__,__LINE__);
 		bio_endio(bio);
 
 		mempool_free(priv, mpath_ns->ctrl->mpath_req_pool);
@@ -1476,7 +1475,6 @@ static void nvme_mpath_endio(struct bio *bio)
         bio->bi_private = priv->bi_private;
 
 
-	printk ("%s %d BIO ENDIO>>>>>>>>>>>>>>>>>>>>>>>\n",__FUNCTION__,__LINE__);
         bio_endio(bio);
 
 	mempool_free(priv, mpath_ns->ctrl->mpath_req_pool);
@@ -1642,7 +1640,6 @@ mpath_retry:
 
 out_exit_mpath_request:
     	bio->bi_status = BLK_STS_IOERR;
-	printk ("%s %d BIO ENDIO>>>>>>>>>>>>>>>>>>>>>>>\n",__FUNCTION__,__LINE__);
 	bio_endio(bio);
 
 out_mpath_return:
