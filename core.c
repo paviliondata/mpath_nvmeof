@@ -3104,7 +3104,7 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
         struct nvme_ctrl *ctrl = NULL;
         struct nvme_ns *ns = NULL;
         int node;
-
+	struct request_queue *rq = blk_alloc_queue(GFP_KERNEL);
 
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
         ctrl = nvme_init_mpath_ctrl(nsa->ctrl);
@@ -3124,7 +3124,7 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
                 goto out_free_ns;
 
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
-	ns->queue = blk_alloc_queue(GFP_KERNEL);
+	ns->queue = rq;
         if (IS_ERR(ns->queue))
                 goto out_release_instance;
 
