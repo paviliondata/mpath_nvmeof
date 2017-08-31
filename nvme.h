@@ -22,7 +22,7 @@
 #include <linux/sed-opal.h>
 
 #undef CONFIG_NVM
-#define PAVILION_DEBUG
+//#define PAVILION_DEBUG
 
 extern unsigned char nvme_io_timeout;
 #define NVME_IO_TIMEOUT	(nvme_io_timeout * HZ)
