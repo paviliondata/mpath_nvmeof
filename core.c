@@ -49,7 +49,7 @@ static unsigned char shutdown_timeout = 5;
 module_param(shutdown_timeout, byte, 0644);
 MODULE_PARM_DESC(shutdown_timeout, "timeout in seconds for controller shutdown");
 
-u8 nvme_max_retries = 5;
+unsigned char nvme_max_retries = 5;
 module_param_named(max_retries, nvme_max_retries, byte, 0644);
 MODULE_PARM_DESC(max_retries, "max number of retries a command may have");
 EXPORT_SYMBOL_GPL(nvme_max_retries);
@@ -233,6 +233,7 @@ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
 		switch (old_state) {
 		case NVME_CTRL_NEW:
 		case NVME_CTRL_LIVE:
+
 			changed = true;
 			/* FALLTHRU */
 		default:
@@ -717,7 +718,8 @@ int __nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
 			ret = -EFAULT;
 	}
  out_free_meta:
-	kfree(meta);
+	if (meta)
+		kfree(meta);
  out_unmap:
 	if (bio) {
 		if (disk && bio->bi_bdev)
@@ -974,10 +976,10 @@ int nvme_set_ns_active(struct nvme_ns *standby_ns, struct nvme_ns *mpath_ns, int
 	priv->mpath_ns = mpath_ns;
 	priv->standby_ns = standby_ns;
 	priv->retries = retry_cnt;
-    	rq = nvme_alloc_request(standby_ns->ctrl->admin_q, &c, BLK_MQ_REQ_RESERVED,
+    rq = nvme_alloc_request(standby_ns->ctrl->admin_q, &c, BLK_MQ_REQ_RESERVED,
                         NVME_QID_ANY);
 
-    	if (IS_ERR(rq)) {
+    if (IS_ERR(rq)) {
 		kfree(priv);
                 return PTR_ERR(rq);
 	}
@@ -1067,6 +1069,26 @@ int nvme_set_queue_count(struct nvme_ctrl *ctrl, int *count)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(nvme_set_queue_count);
+
+static struct nvme_ns *nvme_get_active_ns_for_mpath_ns(struct nvme_ns *mpath_ns)
+{
+	struct nvme_ns *ns = NULL, *next;
+	if (test_bit(NVME_NS_ROOT, &mpath_ns->flags)) {
+		mutex_lock(&mpath_ns->ctrl->namespaces_mutex);
+		list_for_each_entry_safe(ns, next, &mpath_ns->ctrl->namespaces, mpathlist) {
+			if (ns->active) {
+				mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
+				return ns;
+			}
+		}
+		mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
+		/* did not find active */
+		ns = NULL;
+		printk("%s: No active ns found for mpath ns mpnvme%dn%d\n", __FUNCTION__, mpath_ns->ctrl->instance, mpath_ns->instance);
+		return ns;
+	}
+	return mpath_ns;
+}
 
 static struct nvme_ns *nvme_get_ns_for_mpath_ns(struct nvme_ns *mpath_ns)
 {
@@ -1206,6 +1228,7 @@ static void nvme_mpath_cancel_ios(struct nvme_ns *mpath_ns)
 		bio->bi_bdev = priv->bi_bdev;
 		bio->bi_end_io = priv->bi_end_io;
 		bio->bi_private = priv->bi_private;
+
 		bio_endio(bio);
 
 		mempool_free(priv, mpath_ns->ctrl->mpath_req_pool);
@@ -1250,7 +1273,7 @@ static void nvme_mpath_blk_account_io_start(struct bio *bio,
 static void nvme_mpath_resubmit_bios(struct nvme_ns *mpath_ns)
 {
 	struct nvme_mpath_priv *priv;
-    	struct nvme_ns *ns = NULL, *next;
+    struct nvme_ns *ns = NULL, *next;
 	struct bio *bio;
 	struct bio_vec *bvec;
 	struct bio_list bios;
@@ -1311,7 +1334,17 @@ static void nvme_mpath_resubmit_bios(struct nvme_ns *mpath_ns)
                 bio = bio_list_pop(&bios);
 
 		priv = bio->bi_private;
-
+		/*Twice the retries as mpath group has 2 devices*/
+		if (priv->nr_retries != NVME_MPATH_MAX_RETRIES) {
+			//if (priv->nr_retries <= 0) {
+#ifdef PAVILION_DEBUG
+			printk("%s:%d priv nvme%dn%d new nvme%dn%d retry%d\n",__FUNCTION__,__LINE__, priv->ns->ctrl->instance, priv->ns->instance, ns->ctrl->instance, ns->instance, priv->nr_retries);
+#endif
+			//	continue;
+			//}
+			priv->nr_retries--;
+			bvec = &priv->bio->bi_io_vec[0];
+		}
                 priv->ns = ns;
 
                 bio->bi_bdev = ns->bdev;
@@ -1359,6 +1392,8 @@ static int nvme_mpath_kthread(void *data)
 {
         struct nvme_ns *mpath_ns, *next;
 	struct nvme_ctrl *mpath_ctrl, *next_ctrl;
+	///unsigned long flags;
+
 
         while (!kthread_should_stop()) {
                 set_current_state(TASK_INTERRUPTIBLE);
@@ -1500,6 +1535,18 @@ static blk_qc_t nvme_mpath_make_request(struct request_queue *q, struct bio *bio
 mpath_retry:
 	mutex_lock(&mpath_ns->ctrl->namespaces_mutex);
 
+#if 0
+	printk("#############Entering LIST#############\n");
+	list_for_each_entry(ns, &mpath_ns->ctrl->namespaces, mpathlist) {
+                if(ns) {
+			next_ns = list_next_entry(ns, mpathlist);
+                        printk("%s:#### nvme%dn%d ns=%p ns->mpath_ctrl=%p mpath_ns=%p mpath_ns->ctrl=%p next_ns=%p\n",
+                                __FUNCTION__, ns->ctrl->instance, ns->instance, ns, ns->mpath_ctrl, mpath_ns, mpath_ns->ctrl, next_ns);
+                }
+        }
+	printk("#############Exiting LIST#############\n");
+#endif
+
 	list_for_each_entry(ns, &mpath_ns->ctrl->namespaces, mpathlist) {
 		if (test_bit(NVME_NS_REMOVING, &ns->flags))
 			continue;
@@ -1639,7 +1686,7 @@ mpath_retry:
 			__FUNCTION__, mpath_ns->ctrl->instance, mpath_ns->instance);
 
 out_exit_mpath_request:
-    	bio->bi_status = BLK_STS_IOERR;
+    bio->bi_status = BLK_STS_IOERR;
 	bio_endio(bio);
 
 out_mpath_return:
@@ -1652,6 +1699,27 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode,
 		unsigned int cmd, unsigned long arg)
 {
 	struct nvme_ns *ns = bdev->bd_disk->private_data;
+        struct nvme_ns *mpath_ns;
+        mpath_ns = ns;
+        //ns = nvme_get_ns_for_mpath_ns(mpath_ns);
+        printk("nvme%dn%d state is %d cmd %d\r\n",
+                                ns->ctrl->instance, ns->instance, ns->ctrl->state, cmd);
+        ns = nvme_get_active_ns_for_mpath_ns(mpath_ns);
+        if (!ns) {
+                /* fail IOCTL if no active ns found for mpath */
+                return -ENOTTY;
+        }
+
+        if (test_bit(NVME_NS_REMOVING, &ns->flags)) {
+                printk("nvme%dn%d is being removed\r\n", ns->ctrl->instance, ns->instance);
+                return -ENOTTY;
+        }
+        if (ns->ctrl->state != NVME_CTRL_LIVE) {
+                printk("nvme ctrl %d is not live, rejecting IOCTL as state is %d\r\n",
+                                ns->ctrl->instance, ns->ctrl->state);
+                return -ENOTTY;
+        }
+
 
 	switch (cmd) {
 	case NVME_IOCTL_ID:
@@ -3061,6 +3129,7 @@ static int nvme_del_ns_mpath_ctrl(struct nvme_ns *ns)
         mpath_ns = nvme_find_get_mpath_ns(ns->mpath_ctrl);
         mutex_lock(&mpath_ns->ctrl->namespaces_mutex);
         test_and_clear_bit(NVME_NS_MULTIPATH, &ns->flags);
+        list_del_init(&ns->mpathlist);
 	list_for_each_entry_safe(nsa, next, &mpath_ns->ctrl->namespaces, mpathlist) {
 		if (nsa == ns) {
 			printk("%s: Remove nvme%dn%d from mpath group\n", __FUNCTION__, ns->ctrl->instance, ns->instance);
@@ -3101,7 +3170,15 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
         struct nvme_ctrl *ctrl = NULL;
         struct nvme_ns *ns = NULL;
         int node;
-	struct request_queue *rq = blk_alloc_queue(GFP_KERNEL);
+	bool start_thread = false;
+	//struct request_queue *rq = blk_alloc_queue(GFP_KERNEL);
+
+
+
+        if (list_empty(&nvme_mpath_ctrl_list) && IS_ERR_OR_NULL(nvme_mpath_thread)) {
+                start_thread = true;
+                nvme_mpath_thread = NULL;
+        }
 
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
         ctrl = nvme_init_mpath_ctrl(nsa->ctrl);
@@ -3110,7 +3187,7 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
 
         node = dev_to_node(ctrl->dev);
 
-	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
+	printk("%s:(%d) node=%d\n", __FUNCTION__,__LINE__, node);
         ns = kzalloc_node(sizeof(*ns), GFP_KERNEL, node);
         if (!ns)
                 goto out_free_ctrl;
@@ -3121,7 +3198,8 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
                 goto out_free_ns;
 
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
-	ns->queue = rq;
+	ns->queue = blk_alloc_queue(GFP_KERNEL);
+	//ns->queue = rq;
         if (IS_ERR(ns->queue))
                 goto out_release_instance;
 
@@ -3138,20 +3216,25 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
 
         test_and_set_bit(NVME_NS_ROOT, &ns->flags);
         blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
 
 	nvme_set_queue_limits(ctrl, ns->queue);
 
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
 	blk_queue_rq_timeout(ns->queue, mpath_io_timeout * HZ);
 
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
         sprintf(disk_name, "mpnvme%dn%d", ctrl->instance, ns->instance);
 	sprintf(devpath, "/dev/mpnvme%dn%d", ctrl->instance, ns->instance);
         if (nvme_revalidate_ns(nsa, &id))
                 goto out_free_queue;
 
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
         disk = alloc_disk_node(0, node);
         if (!disk)
                 goto out_free_id;
 
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
         disk->fops = &nvme_fops;
         disk->private_data = ns;
         disk->queue = ns->queue;
@@ -3159,14 +3242,21 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
         memcpy(disk->disk_name, disk_name, DISK_NAME_LEN);
         ns->disk = disk;
 
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
         __nvme_revalidate_disk(disk, id);
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
 
-        mutex_lock(&ctrl->namespaces_mutex);
-        list_add_tail(&ns->list, &ctrl->mpath_namespace);
-        mutex_unlock(&ctrl->namespaces_mutex);
+	init_waitqueue_head(&ns->fq_full);
+	init_waitqueue_entry(&ns->fq_cong_wait, nvme_mpath_thread);
+	bio_list_init(&ns->fq_cong);
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
 
 	nsa->mpath_ctrl = ns->ctrl;
 	nsa->ctrl->mpath_ctrl = (void *)ns->ctrl;
+	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
+        mutex_lock(&ctrl->namespaces_mutex);
+        list_add_tail(&ns->list, &ctrl->mpath_namespace);
+        mutex_unlock(&ctrl->namespaces_mutex);
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
 	nvme_add_ns_mpath_ctrl(nsa);
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
@@ -3178,6 +3268,7 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
 	}
 	memcpy(&ns->uuid, &nsa->mpath_uuid, sizeof(ns->uuid));
         kref_get(&ns->ctrl->kref);
+
 
 	device_add_disk(ctrl->device, ns->disk);
 
@@ -3201,15 +3292,28 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa,  struct nvme_ns 
 
 
         kfree(id);
-	init_waitqueue_head(&ns->fq_full);
-	init_waitqueue_entry(&ns->fq_cong_wait, nvme_mpath_thread);
-	bio_list_init(&ns->fq_cong);
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
 
 	if (nvme_set_ns_active(nsa, ns, NVME_FAILOVER_RETRIES)) {
 		pr_info("%s:%d Failed to set active Namespace nvme%dn%d\n", __FUNCTION__, __LINE__, nsa->ctrl->instance, nsa->instance);
 	}
 	printk("%s:(%d)\n", __FUNCTION__,__LINE__);
+
+        if (start_thread) {
+#ifdef  PAVILION_DEBUG
+                printk("nvme_mpath_thread start\n");
+#endif
+                nvme_mpath_thread = kthread_run(nvme_mpath_kthread, NULL, "nvme_mpath");
+        } else
+                wait_event_killable(nvme_mpath_kthread_wait, nvme_mpath_thread);
+
+        if (IS_ERR_OR_NULL(nvme_mpath_thread)) {
+                //ret = nvme_mpath_thread ? PTR_ERR(nvme_mpath_thread) : -EINTR;
+                goto out_sysfs_remove_group;
+        }
+
+
+
     return ns;
 
  out_sysfs_remove_group:
@@ -3249,10 +3353,15 @@ static void nvme_shared_ns(struct nvme_ns *shared_ns)
 	  Check if the namespace is shared and another namespace with same
 	  serial number exist amount the controllers.
 	*/
+//#ifndef PAVILION_DEBUG
         spin_lock(&dev_list_lock);
+//#endif
         list_for_each_entry(ctrl, &nvme_ctrl_list, node) {
 
                 list_for_each_entry(ns, &ctrl->namespaces, list) {
+#ifdef PAVILION_DEBUG
+//			printk("%s shared:%s ns:%s\n", __FUNCTION__, shared_ns->uuid, ns->uuid);
+#endif
 			if (ns == shared_ns)
 				continue;
                         /*
@@ -3261,6 +3370,9 @@ static void nvme_shared_ns(struct nvme_ns *shared_ns)
                          */
                         if (!ns->disk || test_bit(NVME_NS_DEAD, &ns->flags))
                                 continue;
+#ifdef PAVILION_DEBUG
+//			printk("%s ns:%s shared:%s\n", __FUNCTION__, ns->uuid, shared_ns->uuid);
+#endif
                         if (uuid_equal(&ns->uuid, &(shared_ns->uuid))) {
                                 if (test_bit(NVME_NS_MULTIPATH, &ns->flags)) {
                                         shared_ns->mpath_ctrl = ns->mpath_ctrl;
@@ -3274,7 +3386,9 @@ static void nvme_shared_ns(struct nvme_ns *shared_ns)
                 }
 
         }
+//#ifndef PAVILION_DEBUG
        spin_unlock(&dev_list_lock);
+//#endif
 
 	if (shared_ns->nmic & 0x1) {
 		shared_ns->active = 1;
@@ -3282,7 +3396,9 @@ static void nvme_shared_ns(struct nvme_ns *shared_ns)
 	}
         return;
 found_ns:
+//#ifndef PAVILION_DEBUG
         spin_unlock(&dev_list_lock);
+//#endif
         if (ret == ns)
                 nvme_alloc_mpath_ns(ns, shared_ns);
         else
@@ -3458,8 +3574,6 @@ static struct nvme_ns *nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	mutex_unlock(&ctrl->namespaces_mutex);
 
 	kref_get(&ctrl->kref);
-
-	kfree(id);
 
 	device_add_disk(ctrl->device, ns->disk);
 	if (sysfs_create_group(&disk_to_dev(ns->disk)->kobj,
@@ -3916,7 +4030,7 @@ EXPORT_SYMBOL_GPL(nvme_start_ctrl);
 
 void nvme_uninit_ctrl(struct nvme_ctrl *ctrl)
 {
-    	struct task_struct *tmp = NULL;
+    struct task_struct *tmp = NULL;
 	device_destroy(nvme_class, MKDEV(nvme_char_major, ctrl->instance));
 
 	spin_lock(&dev_list_lock);
@@ -3941,7 +4055,9 @@ static void nvme_free_ctrl(struct kref *kref)
 	ida_destroy(&ctrl->ns_ida);
 
 	if (test_bit(NVME_CTRL_MULTIPATH, &ctrl->flags)) {
+//#ifdef PAVILION_DEBUG
 		printk("%s:(%d) mpath free ctrl nvme%d\n", __FUNCTION__, __LINE__, ctrl->instance);
+//#endif
 		if (ctrl->mpath_req_pool) {
 			mempool_destroy(ctrl->mpath_req_pool);
                         kmem_cache_destroy(ctrl->mpath_req_slab);
@@ -4030,8 +4146,9 @@ struct nvme_ctrl *nvme_init_mpath_ctrl(struct nvme_ctrl *ctrl)
         struct nvme_ctrl *mpath_ctrl;
         bool changed;
 	int ret;
+#if 0
 	bool start_thread = false;
-
+#endif
         mpath_ctrl = kzalloc(sizeof(*mpath_ctrl), GFP_KERNEL);
         if (!mpath_ctrl)
                 return ERR_PTR(-ENOMEM);
@@ -4065,12 +4182,12 @@ struct nvme_ctrl *nvme_init_mpath_ctrl(struct nvme_ctrl *ctrl)
         ida_init(&mpath_ctrl->ns_ida);
 
 
-
+#if 0
 	if (list_empty(&nvme_mpath_ctrl_list) && IS_ERR_OR_NULL(nvme_mpath_thread)) {
                 start_thread = true;
                 nvme_mpath_thread = NULL;
         }
-
+#endif
         spin_lock(&dev_list_lock);
         list_add_tail(&mpath_ctrl->node, &nvme_mpath_ctrl_list);
         spin_unlock(&dev_list_lock);
@@ -4102,7 +4219,7 @@ struct nvme_ctrl *nvme_init_mpath_ctrl(struct nvme_ctrl *ctrl)
                         "failed allocating mpath request pool\n");
 		goto out_release_req_slab;
 	}
-
+#if 0
 	if (start_thread) {
 #ifdef  PAVILION_DEBUG
                 printk("nvme_mpath_thread start\n");
@@ -4115,12 +4232,12 @@ struct nvme_ctrl *nvme_init_mpath_ctrl(struct nvme_ctrl *ctrl)
                 ret = nvme_mpath_thread ? PTR_ERR(nvme_mpath_thread) : -EINTR;
                 goto out_release_req_pool;
         }
-
+#endif
 	dev_info(mpath_ctrl->device,"multipath request pool allocated\n");
 
         return mpath_ctrl;
-out_release_req_pool:
-	mempool_destroy(mpath_ctrl->mpath_req_pool);
+//out_release_req_pool:
+//	mempool_destroy(mpath_ctrl->mpath_req_pool);
 out_release_req_slab:
         kmem_cache_destroy(mpath_ctrl->mpath_req_slab);
 	mpath_ctrl->mpath_req_slab = NULL;
