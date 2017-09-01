@@ -22,7 +22,6 @@
 #include <linux/sed-opal.h>
 
 #undef CONFIG_NVM
-//#define PAVILION_DEBUG
 
 extern unsigned char nvme_io_timeout;
 #define NVME_IO_TIMEOUT	(nvme_io_timeout * HZ)
@@ -36,9 +35,7 @@ extern unsigned char mpath_io_timeout;
 extern unsigned int ns_failover_interval;
 #define NS_FAILOVER_INTERVAL   (ns_failover_interval * HZ)
 
-/*We support minimum of two devices*/
-extern unsigned char nvme_max_retries;
-#define NVME_MPATH_MAX_RETRIES	(nvme_max_retries * 2)
+
 #define NVME_DEFAULT_KATO	5
 #define NVME_KATO_GRACE		10
 #define NVME_NS_ACTIVE_TIMEOUT  6
@@ -252,10 +249,9 @@ struct nvme_ns {
 	wait_queue_entry_t	fq_cong_wait;
 	struct bio_list		fq_cong;
 	unsigned long		start_time;
-	int io_cnt;
 	struct list_head mpathlist;
-	u8 mpath_uuid[16];	
-	
+	u8 mpath_nguid[16];
+
 };
 
 struct nvme_ctrl_ops {
@@ -331,7 +327,8 @@ int nvme_init_identify(struct nvme_ctrl *ctrl);
 void nvme_queue_scan(struct nvme_ctrl *ctrl);
 void nvme_remove_namespaces(struct nvme_ctrl *ctrl);
 void nvme_trigger_failover(struct nvme_ctrl *ctrl);
-int nvme_set_ns_active(struct nvme_ns *standby_ns, struct nvme_ns *mpath_ns, int retry_cnt);
+int nvme_set_ns_active(struct nvme_ns *standby_ns, struct nvme_ns *mpath_ns,
+		int retry_cnt);
 
 
 int nvme_sec_submit(void *data, u16 spsp, u8 secp, void *buffer, size_t len,

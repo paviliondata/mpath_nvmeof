@@ -33,8 +33,6 @@
 #include "nvme.h"
 #include "fabrics.h"
 
-#define RDMA_DEBUG printk
-#define RDMA_INFO printk
 
 #define NVME_RDMA_CONNECT_TIMEOUT_MS	3000		/* 3 second */
 
@@ -72,7 +70,6 @@ struct nvme_rdma_request {
 	u32			num_sge;
 	int			nents;
 	bool			inline_data;
-        bool                    need_free;
 	struct ib_reg_wr	reg_wr;
 	struct ib_cqe		reg_cqe;
 	struct nvme_rdma_queue  *queue;
@@ -296,6 +293,7 @@ static int nvme_rdma_reinit_request(void *data, struct request *rq)
 	}
 
 	req->mr->need_inval = false;
+
 out:
 	return ret;
 }
@@ -309,17 +307,11 @@ static void nvme_rdma_exit_request(struct blk_mq_tag_set *set,
 	struct nvme_rdma_queue *queue = &ctrl->queues[queue_idx];
 	struct nvme_rdma_device *dev = queue->device;
 
-	if (!req->need_free) {
-                return;
-        }
-
 	if (req->mr)
 		ib_dereg_mr(req->mr);
 
 	nvme_rdma_free_qe(dev->dev, &req->sqe, sizeof(struct nvme_command),
 			DMA_TO_DEVICE);
-	req->mr->need_inval = false;
-	req->need_free = false;
 }
 
 static int nvme_rdma_init_request(struct blk_mq_tag_set *set,
@@ -347,7 +339,7 @@ static int nvme_rdma_init_request(struct blk_mq_tag_set *set,
 	}
 
 	req->queue = queue;
-	req->need_free = true;
+
 	return 0;
 
 out_free_qe:
@@ -931,12 +923,7 @@ static void nvme_rdma_reconnect_ctrl_work(struct work_struct *work)
 	struct nvme_rdma_ctrl *ctrl = container_of(to_delayed_work(work),
 			struct nvme_rdma_ctrl, reconnect_work);
 	bool changed;
-	struct nvme_ctrl *mpath_ctrl;
 	int ret;
-	mpath_ctrl = (struct nvme_ctrl *)ctrl->ctrl.mpath_ctrl;
-	if (mpath_ctrl) {
-		RDMA_INFO ("nvme%d mpnvme%d %p", ctrl->ctrl.instance, mpath_ctrl->instance, mpath_ctrl);
-	}
 
 	++ctrl->ctrl.nr_reconnects;
 
@@ -944,11 +931,9 @@ static void nvme_rdma_reconnect_ctrl_work(struct work_struct *work)
 		nvme_rdma_destroy_io_queues(ctrl, false);
 
 	nvme_rdma_destroy_admin_queue(ctrl, false);
-
 	ret = nvme_rdma_configure_admin_queue(ctrl, false);
 	if (ret)
 		goto requeue;
-
 
 	if (ctrl->ctrl.queue_count > 1) {
 		ret = nvme_rdma_configure_io_queues(ctrl, false);
