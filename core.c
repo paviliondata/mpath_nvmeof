@@ -1739,7 +1739,6 @@ static int nvme_revalidate_ns(struct nvme_ns *ns, struct nvme_id_ns **id)
 			dev_warn(ns->ctrl->dev, "%s: Failed to get NGUID\n", __func__);
 		} else {
 			memcpy(ns->mpath_nguid, buf, NVME_NIDT_NGUID_LEN);
-			//memcpy(&ns->mpath_uuid, buf, sizeof(ns->uuid));
 			kfree(buf);
 		}
 	}
@@ -3055,7 +3054,6 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa)
 	nvme_add_ns_mpath_ctrl(nsa);
 
 	memcpy(&ns->mpath_nguid, &nsa->mpath_nguid, NVME_NIDT_NGUID_LEN);
-//	memcpy(&ns->uuid, &nsa->mpath_uuid, sizeof(ns->uuid));
 	kref_get(&ns->ctrl->kref);
 
 	device_add_disk(ctrl->device, ns->disk);
