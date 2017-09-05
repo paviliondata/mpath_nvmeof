@@ -1294,6 +1294,9 @@ static void nvme_mpath_resubmit_bios(struct nvme_ns *mpath_ns)
 	/*Get active namespace before resending the IO*/
 
 	mutex_lock(&mpath_ns->ctrl->namespaces_mutex);
+	if (test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags)) {
+		goto namespaces_mutex_unlock;
+        }
 	if (list_empty(&mpath_ns->ctrl->namespaces)) {
 		goto namespaces_mutex_unlock;
 	}
@@ -1469,6 +1472,30 @@ static void nvme_mpath_endio(struct bio *bio)
 	mempool_free(priv, mpath_ns->ctrl->mpath_req_pool);
 }
 
+static void nvme_mpath_priv_bio(struct nvme_mpath_priv *priv, struct bio *bio, 
+struct nvme_ns *ns, struct nvme_ns *mpath_ns)
+{
+	priv->bi_bdev = bio->bi_bdev;
+	priv->bi_end_io = bio->bi_end_io;
+	priv->bi_private = bio->bi_private;
+	priv->bi_flags = bio->bi_flags;
+	priv->bi_sector = bio->bi_iter.bi_sector;
+	priv->nr_bytes = bio->bi_iter.bi_size;
+	priv->bio = bio;
+	priv->bi_vcnt = bio->bi_vcnt;
+	priv->bi_phys_segments = bio->bi_phys_segments;
+	priv->bvec = &bio->bi_io_vec[0];
+	/*Count for two connections, so twice the retry logic.*/
+	priv->nr_retries = nvme_max_retries;
+	priv->start_time = jiffies;
+	priv->ns = ns;
+	priv->mpath_ns = mpath_ns;
+	bio->bi_opf |= REQ_FAILFAST_TRANSPORT;
+	bio->bi_private = priv;
+	bio->bi_end_io = nvme_mpath_endio;
+	bio->bi_bdev = ns->bdev;
+}
+
 static blk_qc_t nvme_mpath_make_request(struct request_queue *q, struct bio *bio)
 
 {
@@ -1493,41 +1520,30 @@ mpath_retry:
 		if (test_bit(NVME_NS_REMOVING, &ns->flags))
 			continue;
 
+		if (test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags)) {
+            		mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
+            		break;
+        	}
 		if(ns->active) {
 			if (ns->mpath_ctrl != mpath_ns->ctrl) {
 				mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
 				dev_err(mpath_ns->ctrl->device, "Incorrect namespace parent child combination.\n");
 				goto mpath_retry;
 			}
-			priv->mpath_ns = mpath_ns;
-			priv->bi_bdev = bio->bi_bdev;
-			priv->bi_end_io = bio->bi_end_io;
-			priv->bi_private = bio->bi_private;
-			priv->bi_flags = bio->bi_flags;
-
-			priv->bi_sector = bio->bi_iter.bi_sector;
-			priv->nr_bytes = bio->bi_iter.bi_size;
-
-			priv->bio = bio;
-			priv->bi_vcnt = bio->bi_vcnt;
-			priv->bi_phys_segments = bio->bi_phys_segments;
-			priv->bvec = &bio->bi_io_vec[0];
-			priv->ns = ns;
-			/*Count for two connections, so twice the retry logic.*/
-			priv->nr_retries = nvme_max_retries;
-
-			bio->bi_opf |= REQ_FAILFAST_TRANSPORT;
-			bio->bi_private = priv;
-			bio->bi_end_io = nvme_mpath_endio;
-			bio->bi_bdev = ns->bdev;
-
-			priv->start_time = jiffies;
+			nvme_mpath_priv_bio(priv, bio, ns, mpath_ns);
 			nvme_mpath_blk_account_io_start(bio, mpath_ns, priv);
-
 			generic_make_request(bio);
 			mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
-
 			goto out_mpath_return;
+		}
+	}
+
+	list_for_each_entry(ns, &mpath_ns->ctrl->namespaces, mpathlist) {
+		if(!ns->active) {
+			nvme_mpath_priv_bio(priv, bio, ns, mpath_ns);
+			nvme_mpath_blk_account_io_start(bio, mpath_ns, priv);
+			mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
+			goto out_exit_mpath_request;
 		}
 	}
 

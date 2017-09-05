@@ -755,10 +755,10 @@ static int nvmf_parse_options(struct nvmf_ctrl_options *opts,
 						opts->reconnect_delay);
 
 	if (!opts->host) {
-		kref_get(&nvmf_default_host->ref);
 		opts->host = nvmf_default_host;
 	}
 
+	kref_get(&opts->host->ref);
 	uuid_copy(&opts->host->id, &hostid);
 
 out:
@@ -813,8 +813,10 @@ void nvmf_free_options(struct nvmf_ctrl_options *opts)
 	kfree(opts->transport);
 	kfree(opts->traddr);
 	kfree(opts->trsvcid);
-	kfree(opts->subsysnqn);
-	kfree(opts->host_traddr);
+    if(opts->subsysnqn)
+	    kfree(opts->subsysnqn);
+    if(opts->host_traddr)
+	    kfree(opts->host_traddr);
 	kfree(opts);
 }
 EXPORT_SYMBOL_GPL(nvmf_free_options);
