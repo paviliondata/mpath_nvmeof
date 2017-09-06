@@ -93,9 +93,6 @@ static DEFINE_SPINLOCK(dev_list_lock);
 static struct task_struct *nvme_mpath_thread;
 static wait_queue_head_t nvme_mpath_kthread_wait;
 static void nvme_mpath_flush_io_work(struct work_struct *work);
-static struct nvme_ns *nvme_get_active_ns_for_mpath_ns(struct nvme_ns *mpath_ns);
-static void nvme_mpath_cancel_ios(struct nvme_ns *mpath_ns);
-static void nvme_mpath_endio(struct bio *bio);
 
 static struct class *nvme_class;
 
@@ -117,9 +114,6 @@ struct nvme_mpath_priv {
 	unsigned long start_time;
 	struct hd_struct *part;
 };
-static void nvme_mpath_blk_account_io_done(struct bio *bio,
-                       struct nvme_ns *mpath_ns,
-                       struct nvme_mpath_priv *priv);
 
 #define NVME_FAILOVER_RETRIES	3
 struct nvme_failover_data {
@@ -800,6 +794,89 @@ static void nvme_keep_alive_work(struct work_struct *work)
 	}
 }
 
+/*
+ * Returns non-zero value if operation is write, zero otherwise.
+ */
+static inline int nvme_mpath_bio_is_write(struct bio *bio)
+{
+
+	return op_is_write(bio_op(bio)) ? 1 : 0;
+
+}
+
+/*
+ * Stats accounting for IO requests on multipath volume.
+ * Same code for stand-alone volume can not be reused since it works on
+ * struct request. Multipath volume does not maintain its own request,
+ * rather it simply redirects IO requests to the active volume.
+ */
+static void nvme_mpath_blk_account_io_done(struct bio *bio,
+					   struct nvme_ns *mpath_ns,
+					   struct nvme_mpath_priv *priv)
+{
+	int rw;
+	int cpu;
+	struct hd_struct *part;
+	unsigned long flags;
+	unsigned long duration;
+
+	spin_lock_irqsave(mpath_ns->queue->queue_lock, flags);
+
+	duration = jiffies - priv->start_time;
+	cpu = part_stat_lock();
+
+	rw = nvme_mpath_bio_is_write(bio);
+	cpu  = part_stat_lock();
+	part = priv->part;
+
+	part_stat_inc(cpu, part, ios[rw]);
+	part_stat_add(cpu, part, ticks[rw], duration);
+	part_round_stats(cpu, part);
+	part_stat_add(cpu, part, sectors[rw], priv->nr_bytes >> 9);
+	part_dec_in_flight(part, rw);
+	part_stat_unlock();
+
+	spin_unlock_irqrestore(mpath_ns->queue->queue_lock, flags);
+}
+
+static void nvme_mpath_cancel_ios(struct nvme_ns *mpath_ns)
+{
+	struct nvme_mpath_priv *priv;
+	struct bio *bio;
+	struct bio_list bios;
+	unsigned long flags;
+
+	mutex_lock(&mpath_ns->ctrl->namespaces_mutex);
+	spin_lock_irqsave(&mpath_ns->ctrl->lock, flags);
+	if (bio_list_empty(&mpath_ns->fq_cong)) {
+		spin_unlock_irqrestore(&mpath_ns->ctrl->lock, flags);
+		goto biolist_empty;
+	}
+
+	bio_list_init(&bios);
+	bio_list_merge(&bios, &mpath_ns->fq_cong);
+
+	bio_list_init(&mpath_ns->fq_cong);
+	remove_wait_queue(&mpath_ns->fq_full, &mpath_ns->fq_cong_wait);
+	spin_unlock_irqrestore(&mpath_ns->ctrl->lock, flags);
+
+	while (bio_list_peek(&bios)) {
+		bio = bio_list_pop(&bios);
+		priv = bio->bi_private;
+
+		bio->bi_status = BLK_STS_IOERR;
+		bio->bi_bdev = priv->bi_bdev;
+		bio->bi_end_io = priv->bi_end_io;
+		bio->bi_private = priv->bi_private;
+        nvme_mpath_blk_account_io_done(bio, mpath_ns, priv);
+		bio_endio(bio);
+
+		mempool_free(priv, mpath_ns->ctrl->mpath_req_pool);
+	}
+biolist_empty:
+	mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
+}
+
 static void nvme_mpath_flush_io_work(struct work_struct *work)
 {
     struct nvme_ctrl *mpath_ctrl = container_of(to_delayed_work(work),
@@ -1249,54 +1326,6 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
 	return status;
 }
 
-static void nvme_mpath_cancel_ios(struct nvme_ns *mpath_ns)
-{
-	struct nvme_mpath_priv *priv;
-	struct bio *bio;
-	struct bio_list bios;
-	unsigned long flags;
-
-	mutex_lock(&mpath_ns->ctrl->namespaces_mutex);
-	spin_lock_irqsave(&mpath_ns->ctrl->lock, flags);
-	if (bio_list_empty(&mpath_ns->fq_cong)) {
-		spin_unlock_irqrestore(&mpath_ns->ctrl->lock, flags);
-		goto biolist_empty;
-	}
-
-	bio_list_init(&bios);
-	bio_list_merge(&bios, &mpath_ns->fq_cong);
-
-	bio_list_init(&mpath_ns->fq_cong);
-	remove_wait_queue(&mpath_ns->fq_full, &mpath_ns->fq_cong_wait);
-	spin_unlock_irqrestore(&mpath_ns->ctrl->lock, flags);
-
-	while (bio_list_peek(&bios)) {
-		bio = bio_list_pop(&bios);
-		priv = bio->bi_private;
-
-		bio->bi_status = BLK_STS_IOERR;
-		bio->bi_bdev = priv->bi_bdev;
-		bio->bi_end_io = priv->bi_end_io;
-		bio->bi_private = priv->bi_private;
-        nvme_mpath_blk_account_io_done(bio, mpath_ns, priv);
-		bio_endio(bio);
-
-		mempool_free(priv, mpath_ns->ctrl->mpath_req_pool);
-	}
-biolist_empty:
-	mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
-}
-
-/*
- * Returns non-zero value if operation is write, zero otherwise.
- */
-static inline int nvme_mpath_bio_is_write(struct bio *bio)
-{
-
-	return op_is_write(bio_op(bio)) ? 1 : 0;
-
-}
-
 /*
  * Starts the io accounting for given io request. Again, code from stand alone
  * volume io accounting can not be shared since it operates on struct request.
@@ -1388,7 +1417,6 @@ static void nvme_mpath_resubmit_bios(struct nvme_ns *mpath_ns)
 		bio->bi_phys_segments = priv->bi_phys_segments;
 		bio->bi_seg_front_size = 0;
 		bio->bi_seg_back_size = 0;
-        bio->bi_end_io = nvme_mpath_endio;
 		atomic_set(&bio->__bi_remaining, 1);
 		generic_make_request(bio);
 	}
@@ -1444,40 +1472,6 @@ static inline int nvme_mpath_bio_has_error(struct bio *bio)
 	return ((bio->bi_status != 0) ? 1:0);
 }
 
-/*
- * Stats accounting for IO requests on multipath volume.
- * Same code for stand-alone volume can not be reused since it works on
- * struct request. Multipath volume does not maintain its own request,
- * rather it simply redirects IO requests to the active volume.
- */
-static void nvme_mpath_blk_account_io_done(struct bio *bio,
-					   struct nvme_ns *mpath_ns,
-					   struct nvme_mpath_priv *priv)
-{
-	int rw;
-	int cpu;
-	struct hd_struct *part;
-	unsigned long flags;
-	unsigned long duration;
-
-	spin_lock_irqsave(mpath_ns->queue->queue_lock, flags);
-
-	duration = jiffies - priv->start_time;
-	cpu = part_stat_lock();
-
-	rw = nvme_mpath_bio_is_write(bio);
-	cpu  = part_stat_lock();
-	part = priv->part;
-
-	part_stat_inc(cpu, part, ios[rw]);
-	part_stat_add(cpu, part, ticks[rw], duration);
-	part_round_stats(cpu, part);
-	part_stat_add(cpu, part, sectors[rw], priv->nr_bytes >> 9);
-	part_dec_in_flight(part, rw);
-	part_stat_unlock();
-
-	spin_unlock_irqrestore(mpath_ns->queue->queue_lock, flags);
-}
 
 static void nvme_mpath_endio(struct bio *bio)
 {
