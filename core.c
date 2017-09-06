@@ -92,6 +92,10 @@ static DEFINE_SPINLOCK(dev_list_lock);
 
 static struct task_struct *nvme_mpath_thread;
 static wait_queue_head_t nvme_mpath_kthread_wait;
+static void nvme_mpath_flush_io_work(struct work_struct *work);
+static struct nvme_ns *nvme_get_active_ns_for_mpath_ns(struct nvme_ns *mpath_ns);
+static void nvme_mpath_cancel_ios(struct nvme_ns *mpath_ns);
+static void nvme_mpath_endio(struct bio *bio);
 
 static struct class *nvme_class;
 
@@ -113,6 +117,9 @@ struct nvme_mpath_priv {
 	unsigned long start_time;
 	struct hd_struct *part;
 };
+static void nvme_mpath_blk_account_io_done(struct bio *bio,
+                       struct nvme_ns *mpath_ns,
+                       struct nvme_mpath_priv *priv);
 
 #define NVME_FAILOVER_RETRIES	3
 struct nvme_failover_data {
@@ -793,6 +800,37 @@ static void nvme_keep_alive_work(struct work_struct *work)
 	}
 }
 
+static void nvme_mpath_flush_io_work(struct work_struct *work)
+{
+    struct nvme_ctrl *mpath_ctrl = container_of(to_delayed_work(work),
+            struct nvme_ctrl, cu_work);
+    struct nvme_ns *mpath_ns = NULL;
+    struct nvme_ns *next;
+
+    list_for_each_entry_safe(mpath_ns, next, &mpath_ctrl->mpath_namespace, list) {
+        if (mpath_ns)
+            break;
+    }
+
+    if (!mpath_ns) {
+        dev_err(mpath_ctrl->device,"No Multipath namespace found.\n");
+        goto exit;
+    }
+
+    if (test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags))
+        goto exit;
+
+    if (test_bit(NVME_NS_ROOT, &mpath_ns->flags)) {
+        printk("Cancelling all pending IOs\n");
+        nvme_mpath_cancel_ios(mpath_ns);
+    }
+
+exit:
+    schedule_delayed_work(&mpath_ctrl->cu_work, nvme_io_timeout*HZ);
+    return;
+}
+
+
 void nvme_start_keep_alive(struct nvme_ctrl *ctrl)
 {
 	if (unlikely(ctrl->kato == 0))
@@ -1240,7 +1278,7 @@ static void nvme_mpath_cancel_ios(struct nvme_ns *mpath_ns)
 		bio->bi_bdev = priv->bi_bdev;
 		bio->bi_end_io = priv->bi_end_io;
 		bio->bi_private = priv->bi_private;
-
+        nvme_mpath_blk_account_io_done(bio, mpath_ns, priv);
 		bio_endio(bio);
 
 		mempool_free(priv, mpath_ns->ctrl->mpath_req_pool);
@@ -1350,6 +1388,7 @@ static void nvme_mpath_resubmit_bios(struct nvme_ns *mpath_ns)
 		bio->bi_phys_segments = priv->bi_phys_segments;
 		bio->bi_seg_front_size = 0;
 		bio->bi_seg_back_size = 0;
+        bio->bi_end_io = nvme_mpath_endio;
 		atomic_set(&bio->__bi_remaining, 1);
 		generic_make_request(bio);
 	}
@@ -1521,7 +1560,6 @@ mpath_retry:
 			continue;
 
 		if (test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags)) {
-            		mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
             		break;
         	}
 		if(ns->active) {
@@ -2991,6 +3029,8 @@ static int nvme_del_ns_mpath_ctrl(struct nvme_ns *ns)
 	if (mpath_ns == nvme_get_ns_for_mpath_ns(mpath_ns)) {
 		nvme_put_ns(mpath_ns);
 		nvme_mpath_ns_remove(mpath_ns);
+        /*cancel delayed work as we are the last device */
+        cancel_delayed_work_sync(&ns->mpath_ctrl->cu_work);
 		return NVME_NO_MPATH_NS_AVAIL;
 	} else {
 		blk_mq_freeze_queue(ns->disk->queue);
@@ -3096,6 +3136,8 @@ static struct nvme_ns *nvme_alloc_mpath_ns(struct nvme_ns *nsa)
 		pr_info("%s:%d Failed to set active Namespace nvme%dn%d\n", __FUNCTION__, __LINE__, nsa->ctrl->instance, nsa->instance);
 	}
 
+    /* init delayed work for IO cleanup when both iface are down */
+    INIT_DELAYED_WORK(&ctrl->cu_work, nvme_mpath_flush_io_work);
     return ns;
 
  out_sysfs_remove_group:
@@ -3269,6 +3311,9 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 		if (active_ns && !standby_ns) {
 			test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
 		}
+        if(!test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags)) {
+            schedule_delayed_work(&mpath_ctrl->cu_work, HZ);
+        }
 		mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
 	}
 }

@@ -208,6 +208,7 @@ struct nvme_ctrl {
 	struct block_device *bdev;
 	struct list_head mpath_namespace;
 	unsigned int  delete_cmd;
+	struct delayed_work cu_work;
 };
 
 struct nvme_ns {
