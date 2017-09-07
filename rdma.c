@@ -183,7 +183,10 @@ static void nvme_rdma_free_qe(struct ib_device *ibdev, struct nvme_rdma_qe *qe,
 		size_t capsule_size, enum dma_data_direction dir)
 {
 	ib_dma_unmap_single(ibdev, qe->dma, capsule_size, dir);
-	kfree(qe->data);
+    if(qe->data) {
+        kfree(qe->data);
+        qe->data = NULL;
+    }
 }
 
 static int nvme_rdma_alloc_qe(struct ib_device *ibdev, struct nvme_rdma_qe *qe,
