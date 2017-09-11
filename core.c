@@ -754,6 +754,7 @@ static void nvme_keep_alive_end_io(struct request *rq, blk_status_t status)
 		dev_err(ctrl->device,
 			"failed nvme_keep_alive_end_io error=%d\n",
 				status);
+		schedule_work(&ctrl->failover_work);
 		return;
 	}
 
@@ -891,7 +892,7 @@ static void nvme_mpath_flush_io_work(struct work_struct *work)
 
     if (!mpath_ns) {
         dev_err(mpath_ctrl->device,"No Multipath namespace found.\n");
-        goto exit;
+        return;
     }
 
     if (test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags))
@@ -902,9 +903,9 @@ static void nvme_mpath_flush_io_work(struct work_struct *work)
         nvme_mpath_cancel_ios(mpath_ns);
     }
 
+    return;
 exit:
     schedule_delayed_work(&mpath_ctrl->cu_work, nvme_io_timeout*HZ);
-    return;
 }
 
 
@@ -3023,8 +3024,8 @@ static int nvme_del_ns_mpath_ctrl(struct nvme_ns *ns)
 	if (mpath_ns == nvme_get_ns_for_mpath_ns(mpath_ns)) {
 		nvme_put_ns(mpath_ns);
 		nvme_mpath_ns_remove(mpath_ns);
-        /*cancel delayed work as we are the last device */
-        cancel_delayed_work_sync(&ns->mpath_ctrl->cu_work);
+		/*cancel delayed work as we are the last device */
+		cancel_delayed_work_sync(&ns->mpath_ctrl->cu_work);
 		return NVME_NO_MPATH_NS_AVAIL;
 	} else {
 		blk_mq_freeze_queue(ns->disk->queue);
@@ -3289,6 +3290,7 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 				if ((jiffies - standby_ns->start_time) < (ns_failover_interval * HZ)) {
 					pr_debug("Failover failed due unmet time interval between consecuting failover on same volume.\n");
 					test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
+					schedule_delayed_work(&mpath_ctrl->cu_work, HZ);
 					break;
 				}
 				active_ns->mpath_ctrl->cleanup_done = 0;
@@ -3297,6 +3299,7 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 				if (nvme_set_ns_active(standby_ns, mpath_ns, NVME_FAILOVER_RETRIES)) {
 					pr_info("%s:%d Failed to set active Namespace nvme%dn%d\n", __FUNCTION__, __LINE__, standby_ns->ctrl->instance, standby_ns->instance);
 					test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
+					schedule_delayed_work(&mpath_ctrl->cu_work, HZ);
 				}
 				break;
 			}
@@ -3305,9 +3308,6 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 		if (active_ns && !standby_ns) {
 			test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
 		}
-        if(!test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags)) {
-            schedule_delayed_work(&mpath_ctrl->cu_work, HZ);
-        }
 		mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
 	}
 }
@@ -3394,12 +3394,9 @@ static struct nvme_ns *nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	if (ns->nmic &  0x1) {
 		ns->bdev = blkdev_get_by_path(devpath,
                                 FMODE_READ | FMODE_WRITE | FMODE_EXCL, _claim_ptr);
-	} else {
-		ns->bdev = blkdev_get_by_path(devpath,
-                                FMODE_READ | FMODE_WRITE , NULL);
-	}
-	if (IS_ERR(ns->bdev)) {
-		goto out_sysfs_remove_group;
+		if (IS_ERR(ns->bdev)) {
+			goto out_sysfs_remove_group;
+		}
 	}
 
 	kfree(id);
@@ -3436,7 +3433,6 @@ static void nvme_ns_remove(struct nvme_ns *ns)
 		nvme_trigger_failover(ns->ctrl);
 	if (ns->mpath_ctrl) {
 		mpath_ctrl = ns->mpath_ctrl;
-		ns->mpath_ctrl->bdev = ns->bdev;
 		if (nvme_del_ns_mpath_ctrl(ns) == NVME_NO_MPATH_NS_AVAIL) {
 			mpath_ctrl = NULL;
 		}
@@ -3445,19 +3441,13 @@ static void nvme_ns_remove(struct nvme_ns *ns)
 				blk_integrity_unregister(ns->disk);
 			sysfs_remove_group(&disk_to_dev(ns->disk)->kobj,
 						&nvme_ns_attr_group);
-
-			if (ns->nmic &  0x1) {
+			if (ns->nmic &  0x1)
 				blkdev_put(ns->bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
-			} else {
-				blkdev_put(ns->bdev, FMODE_READ | FMODE_WRITE);
-			}
-
-
 			del_gendisk(ns->disk);
 			blk_cleanup_queue(ns->queue);
 		}
 
-    } else {
+	} else {
 		if (ns->disk && ns->disk->flags & GENHD_FL_UP) {
 			if (blk_get_integrity(ns->disk))
 				blk_integrity_unregister(ns->disk);
@@ -3466,7 +3456,8 @@ static void nvme_ns_remove(struct nvme_ns *ns)
 				&nvme_ns_attr_group);
 			if (ns->ndev)
 				nvme_nvm_unregister_sysfs(ns);
-			blkdev_put(ns->bdev, FMODE_READ | FMODE_WRITE );
+			if (ns->bdev)
+				blkdev_put(ns->bdev, FMODE_READ | FMODE_WRITE );
 			del_gendisk(ns->disk);
 			blk_cleanup_queue(ns->queue);
 		}
