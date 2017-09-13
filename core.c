@@ -3265,16 +3265,18 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 {
 	struct nvme_ns *active_ns = NULL;
 	struct nvme_ns *standby_ns = NULL;
-	struct nvme_ns *ns = NULL, *next;
+	struct nvme_ns *ns = NULL,*tmp, *next;
 	struct nvme_ctrl *mpath_ctrl = NULL;
 	struct nvme_ns *mpath_ns = NULL;
 	printk("%s:(%d) nvme%d\n", __FUNCTION__, __LINE__, ctrl->instance);
 
 
 	if(test_bit(NVME_CTRL_MPATH_CHILD, &ctrl->flags)) {
-		list_for_each_entry_safe(ns, next, &ctrl->namespaces, list) {
-			mpath_ctrl = ns->mpath_ctrl;
-			break;
+		list_for_each_entry_safe(tmp, next, &ctrl->namespaces, list) {
+			mpath_ctrl = tmp->mpath_ctrl;
+			ns = tmp;
+			if(ns->active)
+				break;
 		}
 	} else {
 		/*We are not part of multipath group.*/
