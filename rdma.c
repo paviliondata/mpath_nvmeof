@@ -951,6 +951,7 @@ static void nvme_rdma_reconnect_ctrl_work(struct work_struct *work)
 	nvme_start_ctrl(&ctrl->ctrl);
 
 	dev_info(ctrl->ctrl.device, "Successfully reconnected\n");
+	nvme_trigger_failover(&ctrl->ctrl);
 
 	return;
 

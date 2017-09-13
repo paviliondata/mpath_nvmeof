@@ -3220,6 +3220,43 @@ static void nvme_trigger_failover_work(struct work_struct *work)
 }
 
 /*
+ This function will try to get an active namespace 
+ when both the interface is down
+ it will return -1 if no active NS found
+ it will return 0 if active NS found but identify not successful
+ it will return 1 if active NS found and identify successful
+ */
+
+static int nvme_update_active(struct nvme_ns *mpath_ns) {
+    struct nvme_ns *ns = NULL, *next;
+    u8 found_active = 0;
+    if(!mpath_ns) {
+        test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
+        return -1;
+    }
+    list_for_each_entry_safe(ns, next, &mpath_ns->ctrl->namespaces, mpathlist) {
+        if(!ns->active && ns->ctrl->state != NVME_CTRL_RECONNECTING) {
+            /* state change happened,will set this ns as new active */
+            found_active = 1;
+            break;
+        }
+    }
+    if(!found_active) {
+        pr_info("No namespace with Multipath support found.\n");
+        test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
+        return -1;
+    }
+
+    /* set ns as next active namespace */
+    if (nvme_set_ns_active(ns, mpath_ns, NVME_FAILOVER_RETRIES)) {
+        pr_info("%s:%d Failed to set active Namespace nvme%dn%d\n", __FUNCTION__, __LINE__, ns->ctrl->instance, ns->instance);
+        test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
+        return 0;
+    }
+    return 1;
+}
+
+/*
  This will only be called in IO Failure scenario
  or on device removal
  or on device disconnect.
@@ -3244,12 +3281,13 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 		return;
 	}
 
-	if (ns && !ns->active) {
-		pr_info("No Failover. Namespace nvme%dn%d not active.\n",ctrl->instance, ns->instance);
-		return;
-	}
 	if (!mpath_ctrl) {
 		pr_info("No namespace with Multipath support found.\n");
+		return;
+	}
+
+	if (ns && !ns->active && mpath_ctrl->cleanup_done) {
+		pr_info("No Failover. Namespace nvme%dn%d not active.\n",ctrl->instance, ns->instance);
 		return;
 	}
 
@@ -3265,10 +3303,16 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 		pr_info("No Multipath namespace found.\n");
 		return;
 	}
-
 	if (test_and_set_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags))  {
 		return;
 	}
+	if (!mpath_ctrl->cleanup_done) {
+		int ret = nvme_update_active(mpath_ns);
+		if(!ret)
+			schedule_delayed_work(&mpath_ctrl->cu_work, HZ);
+		return;
+	}
+
 	/* Iterate through all namespaces related to Multipath controller.
 	   Find a different one from the one in use. This will be the
 	   namespace we will failover to.*/
@@ -3288,7 +3332,7 @@ void nvme_trigger_failover(struct nvme_ctrl *ctrl)
 					break;
 				}
 				if ((jiffies - standby_ns->start_time) < (ns_failover_interval * HZ)) {
-					pr_debug("Failover failed due unmet time interval between consecuting failover on same volume.\n");
+					pr_info("Failover failed due unmet time interval between consecuting failover on same volume.\n");
 					test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
 					schedule_delayed_work(&mpath_ctrl->cu_work, HZ);
 					break;
