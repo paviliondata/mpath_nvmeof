@@ -94,6 +94,15 @@ static struct task_struct *nvme_mpath_thread;
 static wait_queue_head_t nvme_mpath_kthread_wait;
 static void nvme_mpath_flush_io_work(struct work_struct *work);
 
+enum {
+	/*
+	 * Namespace state (Active or Standby) on multipath environment.
+	 */
+	NVME_NS_STATE_ACTIVE = 1,
+	NVME_NS_STATE_STANDBY,
+	NVME_NS_STATE_UNDEFINED,
+};
+
 static struct class *nvme_class;
 
 struct nvme_mpath_priv {
@@ -1076,6 +1085,9 @@ static void nvme_ns_active_end_io(struct request *rq, blk_status_t error)
 	}
 	test_and_clear_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags);
 
+	if(error)
+		schedule_delayed_work(&standby_ns->mpath_ctrl->cu_work, HZ);
+
 	kfree(priv);
 }
 
@@ -1349,10 +1361,31 @@ static void nvme_mpath_blk_account_io_start(struct bio *bio,
 	priv->part = part;
 }
 
+int get_ns_state(struct nvme_ns *ns) {
+	if(ns->active && ns->ctrl->state == NVME_CTRL_LIVE)
+		return NVME_NS_STATE_ACTIVE; /* active */
+
+	if(!ns->active && ns->ctrl->state == NVME_CTRL_LIVE)
+		return NVME_NS_STATE_STANDBY; /* standby */
+
+	return NVME_NS_STATE_UNDEFINED; /* state undefined */
+}
+
+struct nvme_ns* get_ns_active (struct nvme_ns *mpath_ns) {
+	struct nvme_ns *ns = NULL,*next;
+	struct nvme_ns *tmp = NULL;
+	list_for_each_entry_safe(tmp, next, &mpath_ns->ctrl->namespaces, mpathlist) {
+		if((get_ns_state(tmp) == NVME_NS_STATE_ACTIVE) && test_bit(NVME_NS_MULTIPATH, &tmp->flags)) {
+			ns = tmp;
+			break;
+		}
+	}
+	return ns;
+}
 static void nvme_mpath_resubmit_bios(struct nvme_ns *mpath_ns)
 {
 	struct nvme_mpath_priv *priv;
-	struct nvme_ns *ns = NULL, *next;
+	struct nvme_ns *ns = NULL;
 	struct bio *bio;
 	struct bio_vec *bvec;
 	struct bio_list bios;
@@ -1369,10 +1402,7 @@ static void nvme_mpath_resubmit_bios(struct nvme_ns *mpath_ns)
 		goto namespaces_mutex_unlock;
 	}
 
-	list_for_each_entry_safe(ns, next, &mpath_ns->ctrl->namespaces, mpathlist) {
-		if(ns->active && test_bit(NVME_NS_MULTIPATH, &ns->flags))
-			break;
-	}
+	ns = get_ns_active(mpath_ns);
 
 	if (!ns) {
 		goto namespaces_mutex_unlock;
@@ -1557,7 +1587,7 @@ mpath_retry:
 		if (test_bit(NVME_NS_FO_IN_PROGRESS, &mpath_ns->flags)) {
             		break;
         	}
-		if(ns->active) {
+		if(get_ns_state(ns) == NVME_NS_STATE_ACTIVE) {
 			if (ns->mpath_ctrl != mpath_ns->ctrl) {
 				mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);
 				dev_err(mpath_ns->ctrl->device, "Incorrect namespace parent child combination.\n");
@@ -1572,7 +1602,7 @@ mpath_retry:
 	}
 
 	list_for_each_entry(ns, &mpath_ns->ctrl->namespaces, mpathlist) {
-		if(!ns->active) {
+		if(get_ns_state(ns) == NVME_NS_STATE_STANDBY) {
 			nvme_mpath_priv_bio(priv, bio, ns, mpath_ns);
 			nvme_mpath_blk_account_io_start(bio, mpath_ns, priv);
 			mutex_unlock(&mpath_ns->ctrl->namespaces_mutex);

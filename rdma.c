@@ -968,7 +968,6 @@ static void nvme_rdma_error_recovery_work(struct work_struct *work)
 
 	nvme_stop_ctrl(&ctrl->ctrl);
 
-	nvme_trigger_failover(&ctrl->ctrl);
 	if (ctrl->ctrl.queue_count > 1) {
 		nvme_stop_queues(&ctrl->ctrl);
 		nvme_rdma_stop_io_queues(ctrl);
@@ -987,6 +986,7 @@ static void nvme_rdma_error_recovery_work(struct work_struct *work)
 	 * queues are not a live anymore, so restart the queues to fail fast
 	 * new IO
 	 */
+	nvme_trigger_failover(&ctrl->ctrl);
 	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
 	nvme_start_queues(&ctrl->ctrl);
 
